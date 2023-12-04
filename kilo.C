@@ -103,7 +103,7 @@ struct abuf {
 #define ABUF_INIT {NULL, 0}
 
 void abAppend(struct abuf *ab, const char *s, int len) {
-  char *new_ptr = realloc(ab->b, ab->len + len);
+  char *new_ptr = (char *)realloc(ab->b, ab->len + len);
   if (new_ptr == NULL) return;
   memcpy(&new_ptr[ab->len], s, len);
   ab->b = new_ptr;

@@ -64,7 +64,6 @@ struct editorConfig {
   time_t statusmsg_time;
   struct termios orig_termios;
 };
-
 struct editorConfig E;
 
 

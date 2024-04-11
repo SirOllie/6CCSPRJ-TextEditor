@@ -27,6 +27,8 @@
 #define KILO_VERSION "0.0.1"
 #define KILO_TAB_STOP 8
 #define KILO_QUIT_TIMES 3
+#define KILO_BOOKMARK_CAPACITY 50
+#define KILO_REGION_CAPACITY 50
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
@@ -51,7 +53,8 @@ enum editorHighlight {
   HL_KEYWORD2,
   HL_STRING,
   HL_NUMBER,
-  HL_MATCH
+  HL_MATCH,
+  HL_BOOKMARK
 };
 
 #define HL_HIGHLIGHT_NUMBERS (1<<0)
@@ -87,6 +90,27 @@ typedef struct erow {
   int hl_open_comment;
 } erow;
 
+
+
+
+
+struct locationPointer {
+  int row;
+  int column;
+};
+
+struct bookmark {
+  struct locationPointer location;
+};
+
+struct region {
+  struct locationPointer l_pointer;
+  struct locationPointer r_pointer;
+};
+
+
+
+
 struct editorConfig {
   int cx, cy;
   int rx;
@@ -95,6 +119,10 @@ struct editorConfig {
   int screenrows;
   int screencols;
   int numrows;
+
+  int numchars;
+  int numwords;
+
   erow *row;
   int dirty;
   char *filename;
@@ -102,9 +130,16 @@ struct editorConfig {
   time_t statusmsg_time;
   struct editorSyntax *syntax;
   struct termios orig_termios;
+
+  struct bookmark bookmarks[KILO_BOOKMARK_CAPACITY];
+  int num_bookmarks;
+
+  struct region regions[KILO_REGION_CAPACITY];
+  int num_regions;
 };
 
 struct editorConfig E;
+
 
 /*** filetypes ***/
 
@@ -239,6 +274,34 @@ int is_separator(int c) {
 void editorUpdateSyntax(erow *row) {
   row->hl = (unsigned char *)realloc(row->hl, row->rsize);
   memset(row->hl, HL_NORMAL, row->rsize);
+
+//THIS DOES THE BOOKMARK HIGHLIGHTING!!!
+  int i = 0;
+  while (i < row->rsize) {
+    if (E.num_bookmarks > 0) {
+      int is_bookmark = 0;
+      for (int b = 0; b < E.num_bookmarks; b++) {
+        if (E.bookmarks[b].location.column == i && E.bookmarks[b].location.row == row->idx) {
+          is_bookmark = 1;
+          break;
+        }
+      }
+
+      char c = row->render[i];
+      unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
+
+      if (is_bookmark) {
+        row->hl[i] = HL_BOOKMARK; 
+      }
+
+      
+    }
+    i++;
+  }
+
+
+
+
   if (E.syntax == NULL) return;
   char **keywords = E.syntax->keywords;
   char *scs = E.syntax->singleline_comment_start;
@@ -250,7 +313,7 @@ void editorUpdateSyntax(erow *row) {
   int prev_sep = 1;
   int in_string = 0;
   int in_comment = (row->idx > 0 && E.row[row->idx - 1].hl_open_comment);
-  int i = 0;
+  i = 0;
   while (i < row->rsize) {
     char c = row->render[i];
     unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
@@ -348,6 +411,7 @@ int editorSyntaxToColor(int hl) {
     case HL_NUMBER: return 31;
     case HL_MATCH: return 34;
     default: return 37;
+    case HL_BOOKMARK: return 94;
   }
 }
 
@@ -475,11 +539,17 @@ void editorFreeRow(erow *row) {
 
 void editorDelRow(int at) {
   if (at < 0 || at >= E.numrows) return;
+
+
+
   editorFreeRow(&E.row[at]);
   memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
   for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--;
   E.numrows--;
   E.dirty++;
+
+ 
+
 }
 
 void editorRowInsertChar(erow *row, int at, int c) {
@@ -509,15 +579,134 @@ void editorRowDelChar(erow *row, int at) {
   E.dirty++;
 }
 
+
+
+/*** bookmarks ***/
+
+void createBookmark() {
+  struct bookmark new_bookmark;
+
+  new_bookmark.location.row = E.cy;
+  new_bookmark.location.column = E.cx;
+  erow *row = &E.row[E.cy];
+
+  if (E.num_bookmarks <= KILO_BOOKMARK_CAPACITY) {
+      E.bookmarks[E.num_bookmarks] = new_bookmark;
+      E.num_bookmarks++;
+    }
+  }
+
+void updateBookmarkPointerOnInsert() {
+
+  erow *row = &E.row[E.cy];
+
+  for (int i = 0; i < E.num_bookmarks; i++) {
+    if ((E.bookmarks[i].location.row == (E.cy)) && E.cx < E.bookmarks[i].location.column) {
+      E.bookmarks[i].location.column++;
+    }
+  }
+}
+
+void updateBookmarkPointerOnDelete() {
+
+  erow *row = &E.row[E.cy];
+
+  for (int i = 0; i < E.num_bookmarks; i++) {
+    int y = E.bookmarks[i].location.row;
+    int x = E.bookmarks[i].location.column;
+    if ((y == (E.cy)) && E.cx <= x && E.cx != 0) {
+      E.bookmarks[i].location.column--;
+    }
+  }
+}
+
+void updateBookmarkPointerOnDeleteLine() {
+
+  erow *row = &E.row[E.cy];
+
+  for (int i = 0; i < E.num_bookmarks; i++) {
+
+    int y = E.bookmarks[i].location.row;
+    int x = E.bookmarks[i].location.column;
+
+    if (y == E.cy) {
+      E.bookmarks[i].location.row--;
+      E.bookmarks[i].location.column = x + E.row[E.cy-1].rsize;
+    } else if (y > E.cy) {
+      E.bookmarks[i].location.row--;
+    }
+  }
+}
+
+void cycleBookmarks() {
+  int x = E.cx;
+  int y = E.cy;
+  struct bookmark closest;
+  int found = 0;
+
+  if (E.num_bookmarks < 1) {
+    return;
+  }
+
+  for (int i = 0; i < E.num_bookmarks; i++) {
+    int current_row = E.bookmarks[i].location.row;
+    int current_column = E.bookmarks[i].location.column;
+
+    if (current_row >= y) {
+      if (found) {
+        if (current_row - y < closest.location.row - y) {
+          closest = E.bookmarks[i];
+        } else if (current_row == closest.location.row) {
+          if (current_column < closest.location.column) {
+            closest = E.bookmarks[i];
+          }
+        }
+      } else if (current_row > y || (current_row == y && current_column > x)) {
+        closest = E.bookmarks[i];
+        found = 1;
+      } 
+    }
+  }
+
+  if (found) {
+    E.cx = closest.location.column;
+    E.cy = closest.location.row;
+  } else {
+    if (E.num_bookmarks > 0) {
+      E.cx = 0;
+      E.cy = 0;
+    }
+  }
+}
+
+
 /*** editor operations ***/
 
 void editorInsertChar(int c) {
+
+  erow *row = &E.row[E.cy];
+
+///////DOING STATISTICS/////////
+  if (!(isspace(c)) && E.cx == 0) {
+    E.numwords++;
+  } else if (!(isspace(c)) && (isspace(row->chars[(E.cx)-1]))) {
+    E.numwords++;
+  }
+
+  updateBookmarkPointerOnInsert();
+  editorUpdateSyntax(row);
+
   if (E.cy == E.numrows) {
     editorInsertRow(E.numrows, "", 0);
   }
   editorRowInsertChar(&E.row[E.cy], E.cx, c);
   E.cx++;
+
+  E.numchars++;
+  
 }
+
+
 
 void editorInsertNewline() {
   if (E.cx == 0) {
@@ -534,21 +723,47 @@ void editorInsertNewline() {
   E.cx = 0;
 }
 
+
+
 void editorDelChar() {
+
+  erow *row = &E.row[E.cy];
+
+//statistics for WORDS
+  if (E.cx == 1) {
+    E.numwords--;
+  } else if (isspace(row->chars[(E.cx)-2]) && !(isspace(row->chars[(E.cx)-1]))) {
+    E.numwords--;
+  }
+
+  updateBookmarkPointerOnDelete();
+  editorUpdateSyntax(row);
+
   if (E.cy == E.numrows) return;
   if (E.cx == 0 && E.cy == 0) return;
 
-  erow *row = &E.row[E.cy];
+
   if (E.cx > 0) {
     editorRowDelChar(row, E.cx - 1);
     E.cx--;
   } else {
     E.cx = E.row[E.cy - 1].size;
+
+    updateBookmarkPointerOnDeleteLine();
+    editorUpdateSyntax(row);
+
     editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
     editorDelRow(E.cy);
     E.cy--;
   }
+
+  E.numchars--;
 }
+
+/*** statistics ***/
+
+
+
 
 /*** file i/o ***/
 
@@ -581,14 +796,32 @@ void editorOpen(char *filename) {
   char *line = NULL;
   size_t linecap = 0;
   ssize_t linelen;
+
   while ((linelen = getline(&line, &linecap, fp)) != -1) {
-    while (linelen > 0 && (line[linelen - 1] == '\n' ||
-                           line[linelen - 1] == '\r'))
+    while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r'))
       linelen--;
+
+    // Count words in the current line
+    int in_word = 0;
+    for (int i = 0; i < linelen; i++) {
+      if (!isspace(line[i])) {
+        if (!in_word) {
+          E.numwords++;
+          in_word = 1;
+        }
+      } else {
+        in_word = 0;
+      }
+    }
+
+    E.numchars += linelen;
     editorInsertRow(E.numrows, line, linelen);
+
   }
+
   free(line);
   fclose(fp);
+
   E.dirty = 0;
 }
 
@@ -799,6 +1032,26 @@ void editorProcessKeypress() {
 
   switch (c) {
     case '\r':
+      
+
+      /////////this is doing the newline dynamics of bookmarks///////
+  
+      for (int i = 0; i < E.num_bookmarks; i++) {
+          //For when a character is removed from the same line as a bookmark before the bookmark (said bookmark should have it's column decreased by 1)
+        int y = E.bookmarks[i].location.row;
+        int x = E.bookmarks[i].location.column;
+
+        if (y == E.cy && x >= E.cx) {
+          E.bookmarks[i].location.row++;
+          E.bookmarks[i].location.column -= E.cx;
+        } else if (y > E.cy) {
+          E.bookmarks[i].location.row++;
+        }
+        printf("/Bookmark column: %d | Bookmark row: %d//", E.bookmarks[i].location.column, E.bookmarks[i].location.row); //for testing
+      }
+      
+
+
       editorInsertNewline();
       break;
 
@@ -817,6 +1070,21 @@ void editorProcessKeypress() {
     case CTRL_KEY('s'):
       editorSave();
       break;
+
+//----------------------------------------------
+
+    case CTRL_KEY('b'): {
+      erow *row = &E.row[E.cy];
+      createBookmark();
+      editorUpdateSyntax(row);
+      break;
+    }
+
+    case CTRL_KEY('n'):
+      cycleBookmarks();
+      break;
+
+//----------------------------------------------
 
     case HOME_KEY:
       E.cx = 0;
@@ -960,8 +1228,8 @@ void editorDrawRows(struct abuf *ab) {
 void editorDrawStatusBar(struct abuf *ab) {
   abAppend(ab, "\x1b[7m", 4);
   char status[80], rstatus[80];
-  int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
-    E.filename ? E.filename : "[No Name]", E.numrows,
+  int len = snprintf(status, sizeof(status), "%.20s - %d lines - %d characters - %d words %s",
+    E.filename ? E.filename : "[No Name]", E.numrows, E.numchars, E.numwords,
     E.dirty ? "(modified)" : "");
   int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d/%d",
     E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.numrows);

@@ -126,6 +126,7 @@ struct editorConfig {
   erow *row;
   int dirty;
   char *filename;
+  const char* meta_filename = "_metadata";
   char statusmsg[80];
   time_t statusmsg_time;
   struct editorSyntax *syntax;
@@ -440,159 +441,20 @@ void editorSelectSyntaxHighlight() {
   }
 }
 
-/*** row operations ***/
-
-int editorRowCxToRx(erow *row, int cx) {
-  int rx = 0;
-  int j;
-  for (j = 0; j < cx; j++) {
-    if (row->chars[j] == '\t')
-      rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
-    rx++;
-  }
-  return rx;
-}
-
-int editorRowRxToCx(erow *row, int rx) {
-  int cur_rx = 0;
-  int cx;
-  for (cx = 0; cx < row->size; cx++) {
-    if (row->chars[cx] == '\t')
-      cur_rx += (KILO_TAB_STOP - 1) - (cur_rx % KILO_TAB_STOP);
-    cur_rx++;
-
-    if (cur_rx > rx) return cx;
-  }
-  return cx;
-}
-
-
-void editorUpdateRow(erow *row) {
-  int tabs = 0;
-  int j;
-  for (j = 0; j < row->size; j++)
-    if (row->chars[j] == '\t') tabs++;
-  free(row->render);
-  row->render = (char*)malloc(row->size + tabs*(KILO_TAB_STOP - 1) + 1);
-  int idx = 0;
-  for (j = 0; j < row->size; j++) {
-    if (row->chars[j] == '\t') {
-      row->render[idx++] = ' ';
-      while (idx % KILO_TAB_STOP != 0) row->render[idx++] = ' ';
-    } else {
-      row->render[idx++] = row->chars[j];
-    }
-  }
-  row->render[idx] = '\0';
-  row->rsize = idx;
-
-  editorUpdateSyntax(row);
-}
-
-void editorInsertRow(int at, char *s, size_t len) {
-  if (at < 0 || at > E.numrows) return;
-
-  E.row = (erow*)realloc(E.row, sizeof(erow) * (E.numrows + 1));
-  memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
-  for (int j = at + 1; j <= E.numrows; j++) E.row[j].idx++;
-
-  E.row[at].idx = at;
-
-  E.row[at].size = len;
-  E.row[at].chars = (char*)malloc(len + 1);
-  memcpy(E.row[at].chars, s, len);
-  E.row[at].chars[len] = '\0';
-
-  E.row[at].rsize = 0;
-  E.row[at].render = NULL;
-  E.row[at].hl = NULL;
-  E.row[at].hl_open_comment = 0;
-  editorUpdateRow(&E.row[at]);
-
-  E.numrows++;
-  E.dirty++;
-}
-
-
-void editorAppendRow(char *s, size_t len) {
-  E.row = (erow*)realloc(E.row, sizeof(erow) * (E.numrows + 1));
-
-  int at = E.numrows;
-  E.row[at].size = len;
-  E.row[at].chars = (char*)malloc(len + 1);
-  memcpy(E.row[at].chars, s, len);
-  E.row[at].chars[len] = '\0';
-
-  E.row[at].rsize = 0;
-  E.row[at].render = NULL;
-  editorUpdateRow(&E.row[at]);
-
-  E.numrows++;
-  E.dirty++;
-}
-
-void editorFreeRow(erow *row) {
-  free(row->render);
-  free(row->chars);
-  free(row->hl);
-}
-
-void editorDelRow(int at) {
-  if (at < 0 || at >= E.numrows) return;
-
-
-
-  editorFreeRow(&E.row[at]);
-  memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
-  for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--;
-  E.numrows--;
-  E.dirty++;
-
- 
-
-}
-
-void editorRowInsertChar(erow *row, int at, int c) {
-  if (at < 0 || at > row->size) at = row->size;
-  row->chars = (char*)realloc(row->chars, row->size + 2);
-  memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
-  row->size++;
-  row->chars[at] = c;
-  editorUpdateRow(row);
-  E.dirty++;
-}
-
-void editorRowAppendString(erow *row, char *s, size_t len) {
-  row->chars = (char*)realloc(row->chars, row->size + len + 1);
-  memcpy(&row->chars[row->size], s, len);
-  row->size += len;
-  row->chars[row->size] = '\0';
-  editorUpdateRow(row);
-  E.dirty++;
-}
-
-void editorRowDelChar(erow *row, int at) {
-  if (at < 0 || at >= row->size) return;
-  memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
-  row->size--;
-  editorUpdateRow(row);
-  E.dirty++;
-}
-
-
 
 /*** bookmarks ***/
 
-void createBookmark() {
+void createBookmark(int x, int y) {
   struct bookmark new_bookmark;
 
-  new_bookmark.location.row = E.cy;
-  new_bookmark.location.column = E.cx;
-  erow *row = &E.row[E.cy];
+  new_bookmark.location.row = y;
+  new_bookmark.location.column = x;
+  erow *row = &E.row[y];
 
   if (E.num_bookmarks <= KILO_BOOKMARK_CAPACITY) {
       E.bookmarks[E.num_bookmarks] = new_bookmark;
       E.num_bookmarks++;
+      E.dirty++;
     }
   }
 
@@ -678,6 +540,227 @@ void cycleBookmarks() {
     }
   }
 }
+
+
+/*** saving bookmarks and regions ***/
+
+void savePointers() {
+  size_t newLength = strlen(E.filename) + strlen(E.meta_filename) + 100;
+
+  char* mfn = (char*)malloc(newLength * sizeof(char));
+
+  snprintf(mfn, newLength, "%s%s", E.filename, "_metadata");
+
+  FILE *fp_meta = fopen(mfn, "w");
+  //fclose(fp_meta);
+
+  if (E.num_bookmarks != 0 || E.num_regions != 0) {
+    for (int i = 0; i < E.num_bookmarks; i++) {
+      char temp_buffer[50];
+      sprintf(temp_buffer,"%d,%d_", E.bookmarks[i].location.column, E.bookmarks[i].location.row);
+      //scanf(temp_buffer);
+      fputs(temp_buffer, fp_meta);
+      
+    }
+  }
+  fclose(fp_meta);
+  free(mfn);
+}
+
+void readMetadata() {
+
+  size_t newLength = strlen(E.filename) + strlen(E.meta_filename) + 100;
+
+  char* newfile = (char*)malloc(newLength * sizeof(char));
+
+  snprintf(newfile, newLength, "%s%s", E.filename, "_metadata");
+
+  FILE *fp_meta = fopen(newfile, "a+");
+
+  if (fp_meta == NULL) {
+    return;
+  }
+
+  char line[100];
+  while (fgets(line, sizeof(line), fp_meta)) {
+    char *token = strtok(line, "_");
+
+    while (token != NULL) {
+      int i = 0;
+      char *start = token;
+      while (token[i] != ',' && token[i] != '\0') {
+        i++;
+      }
+      int num1, num2;
+      token[i] = '\0'; 
+
+      num1 = atoi(start);
+
+      start = token + i + 1; 
+      i = 0;
+      while (token[i] != '\0') {
+        i++;
+      }
+      token[i] = '\0'; 
+
+      num2 = atoi(start);
+
+      createBookmark(num1, num2);
+
+      token = line; 
+      token = strtok(NULL, "_"); 
+    }
+  }
+
+fclose(fp_meta);
+}
+
+
+
+
+/*** row operations ***/
+
+int editorRowCxToRx(erow *row, int cx) {
+  int rx = 0;
+  int j;
+  for (j = 0; j < cx; j++) {
+    if (row->chars[j] == '\t')
+      rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+    rx++;
+  }
+  return rx;
+}
+
+int editorRowRxToCx(erow *row, int rx) {
+  int cur_rx = 0;
+  int cx;
+  for (cx = 0; cx < row->size; cx++) {
+    if (row->chars[cx] == '\t')
+      cur_rx += (KILO_TAB_STOP - 1) - (cur_rx % KILO_TAB_STOP);
+    cur_rx++;
+
+    if (cur_rx > rx) return cx;
+  }
+  return cx;
+}
+
+
+void editorUpdateRow(erow *row) {
+  int tabs = 0;
+  int j;
+  for (j = 0; j < row->size; j++)
+    if (row->chars[j] == '\t') tabs++;
+  free(row->render);
+  row->render = (char*)malloc(row->size + tabs*(KILO_TAB_STOP - 1) + 1);
+  int idx = 0;
+  for (j = 0; j < row->size; j++) {
+    if (row->chars[j] == '\t') {
+      row->render[idx++] = ' ';
+      while (idx % KILO_TAB_STOP != 0) row->render[idx++] = ' ';
+    } else {
+      row->render[idx++] = row->chars[j];
+    }
+  }
+  row->render[idx] = '\0';
+  row->rsize = idx;
+
+  editorUpdateSyntax(row);
+}
+
+void editorInsertRow(int at, char *s, size_t len) {
+  if (at < 0 || at > E.numrows) return;
+
+  E.row = (erow*)realloc(E.row, sizeof(erow) * (E.numrows + 1));
+  memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
+  for (int j = at + 1; j <= E.numrows; j++) E.row[j].idx++;
+
+  E.row[at].idx = at;
+
+  E.row[at].size = len;
+  E.row[at].chars = (char*)malloc(len + 1);
+  memcpy(E.row[at].chars, s, len);
+  E.row[at].chars[len] = '\0';
+
+  E.row[at].rsize = 0;
+  E.row[at].render = NULL;
+  E.row[at].hl = NULL;
+  E.row[at].hl_open_comment = 0;
+  editorUpdateRow(&E.row[at]);
+
+    //define bookmarks from metadata file
+  readMetadata();
+  editorUpdateSyntax(E.row);
+
+  E.numrows++;
+  E.dirty++;
+}
+
+
+void editorAppendRow(char *s, size_t len) {
+  E.row = (erow*)realloc(E.row, sizeof(erow) * (E.numrows + 1));
+
+  int at = E.numrows;
+  E.row[at].size = len;
+  E.row[at].chars = (char*)malloc(len + 1);
+  memcpy(E.row[at].chars, s, len);
+  E.row[at].chars[len] = '\0';
+
+  E.row[at].rsize = 0;
+  E.row[at].render = NULL;
+  editorUpdateRow(&E.row[at]);
+
+  E.numrows++;
+  E.dirty++;
+}
+
+void editorFreeRow(erow *row) {
+  free(row->render);
+  free(row->chars);
+  free(row->hl);
+}
+
+void editorDelRow(int at) {
+  if (at < 0 || at >= E.numrows) return;
+
+
+
+  editorFreeRow(&E.row[at]);
+  memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
+  for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--;
+  E.numrows--;
+  E.dirty++;
+
+ 
+
+}
+
+void editorRowInsertChar(erow *row, int at, int c) {
+  if (at < 0 || at > row->size) at = row->size;
+  row->chars = (char*)realloc(row->chars, row->size + 2);
+  memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+  row->size++;
+  row->chars[at] = c;
+  editorUpdateRow(row);
+  E.dirty++;
+}
+
+void editorRowAppendString(erow *row, char *s, size_t len) {
+  row->chars = (char*)realloc(row->chars, row->size + len + 1);
+  memcpy(&row->chars[row->size], s, len);
+  row->size += len;
+  row->chars[row->size] = '\0';
+  editorUpdateRow(row);
+  E.dirty++;
+}
+
+void editorRowDelChar(erow *row, int at) {
+  if (at < 0 || at >= row->size) return;
+  memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+  row->size--;
+  editorUpdateRow(row);
+  E.dirty++;
+}
+
 
 
 /*** editor operations ***/
@@ -815,6 +898,9 @@ void editorOpen(char *filename) {
     }
 
     E.numchars += linelen;
+
+
+
     editorInsertRow(E.numrows, line, linelen);
 
   }
@@ -1069,13 +1155,14 @@ void editorProcessKeypress() {
 
     case CTRL_KEY('s'):
       editorSave();
+      savePointers();
       break;
 
 //----------------------------------------------
 
     case CTRL_KEY('b'): {
       erow *row = &E.row[E.cy];
-      createBookmark();
+      createBookmark(E.cx, E.cy);
       editorUpdateSyntax(row);
       break;
     }
@@ -1309,7 +1396,7 @@ int main(int argc, char *argv[]) {
   }
 
   editorSetStatusMessage(
-    "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
+    "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find | Ctrl-B = create bookmark | Ctrl-N = move to next bookmark");
 
   while (1) {
     editorRefreshScreen();

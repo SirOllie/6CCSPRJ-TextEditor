@@ -1,5 +1,6 @@
 //Base Text Editor Implementation
 //Based off the kilo text editor C implementation by antirez and tutorial found at https://viewsourcecode.org/snaptoken/kilo/index.html
+//For an understanding of base kilo, reading the feature chapters will identify which features were previously implemented
 //Oliver Singer
 
 /*** includes ***/
@@ -27,6 +28,7 @@
 #define KILO_VERSION "0.0.1"
 #define KILO_TAB_STOP 8
 #define KILO_QUIT_TIMES 3
+#define KILO_R_TIMES 1
 #define KILO_BOOKMARK_CAPACITY 50
 #define KILO_REGION_CAPACITY 50
 
@@ -54,19 +56,22 @@ enum editorHighlight {
   HL_STRING,
   HL_NUMBER,
   HL_MATCH,
-  HL_BOOKMARK
+  HL_BOOKMARK,
+  HL_REGION_L,
+  HL_REGION_R,
+  HL_REGION_M
 };
 
 #define HL_HIGHLIGHT_NUMBERS (1<<0)
 #define HL_HIGHLIGHT_STRINGS (1<<1)
 
-/*** prototypes ***/
+/*** prototypes ***/ //Functions part of kilo text editor C implementation by antirez 
 
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
 
-/*** data ***/
+/*** data ***/ //Functions part of kilo text editor C implementation by antirez with my own additions
 
 struct editorSyntax {
   char *filetype;
@@ -90,10 +95,7 @@ typedef struct erow {
   int hl_open_comment;
 } erow;
 
-
-
-
-
+//-----------------------
 struct locationPointer {
   int row;
   int column;
@@ -107,9 +109,7 @@ struct region {
   struct locationPointer l_pointer;
   struct locationPointer r_pointer;
 };
-
-
-
+//-----------------------
 
 struct editorConfig {
   int cx, cy;
@@ -120,23 +120,34 @@ struct editorConfig {
   int screencols;
   int numrows;
 
+//-----------------------
   int numchars;
   int numwords;
+//-----------------------
 
   erow *row;
   int dirty;
   char *filename;
-  const char* meta_filename = "_metadata";
+
+//-----------------------
+  const char* meta_filename1 = "_metadata1";
+  const char* meta_filename2 = "_metadata2";
   char statusmsg[80];
+//-----------------------
+
   time_t statusmsg_time;
   struct editorSyntax *syntax;
   struct termios orig_termios;
 
+//-----------------------
   struct bookmark bookmarks[KILO_BOOKMARK_CAPACITY];
   int num_bookmarks;
 
   struct region regions[KILO_REGION_CAPACITY];
+  struct locationPointer temp_pointer;
+  struct locationPointer temp_pointer2;
   int num_regions;
+//-----------------------
 };
 
 struct editorConfig E;
@@ -162,6 +173,7 @@ struct editorSyntax HLDB[] = {
 };
 
 #define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
+
 
 /*** terminal ***/
 
@@ -266,23 +278,25 @@ int getWindowSize(int *rows, int *cols) {
   }
 }
 
+
 /*** syntax highlighting ***/
 
 int is_separator(int c) {
   return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
 }
 
+//Function based on kilo implementation by antirez with heavy additions
 void editorUpdateSyntax(erow *row) {
   row->hl = (unsigned char *)realloc(row->hl, row->rsize);
   memset(row->hl, HL_NORMAL, row->rsize);
 
-//THIS DOES THE BOOKMARK HIGHLIGHTING!!!
   int i = 0;
+
   while (i < row->rsize) {
     if (E.num_bookmarks > 0) {
       int is_bookmark = 0;
       for (int b = 0; b < E.num_bookmarks; b++) {
-        if (E.bookmarks[b].location.column == i && E.bookmarks[b].location.row == row->idx) {
+        if (E.bookmarks[b].location.column == i && E.bookmarks[b].location.row == row->idx && E.num_bookmarks > 0) {
           is_bookmark = 1;
           break;
         }
@@ -295,13 +309,30 @@ void editorUpdateSyntax(erow *row) {
         row->hl[i] = HL_BOOKMARK; 
       }
 
-      
+    } if (E.num_regions > 0) {
+      int is_l = 0;
+      int is_r = 0;
+      for (int b = 0; b < E.num_regions; b++) {
+        if (E.regions[b].l_pointer.column == i && E.regions[b].l_pointer.row == row->idx && E.num_regions > 0) {
+          is_l = 1;
+          break;
+        } else if (E.regions[b].r_pointer.column == i && E.regions[b].r_pointer.row == row->idx && E.num_regions > 0) {
+          is_r = 1;
+          break;
+        }
+      }
+
+      char c = row->render[i];
+      unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
+
+      if (is_l) {
+        row->hl[i] = HL_REGION_L; 
+      } else if (is_r) {
+        row->hl[i] = HL_REGION_R;
+      }
     }
     i++;
   }
-
-
-
 
   if (E.syntax == NULL) return;
   char **keywords = E.syntax->keywords;
@@ -413,6 +444,9 @@ int editorSyntaxToColor(int hl) {
     case HL_MATCH: return 34;
     default: return 37;
     case HL_BOOKMARK: return 94;
+    case HL_REGION_L: return 92;
+    case HL_REGION_R: return 91;
+    case HL_REGION_M: return 93;
   }
 }
 
@@ -441,6 +475,13 @@ void editorSelectSyntaxHighlight() {
   }
 }
 
+void editorFullSyntaxUpdate() {
+  for (int i = 0; i < E.numrows; i++) {
+    erow *row = &E.row[i];
+    editorUpdateSyntax(row);
+  }
+}
+
 
 /*** bookmarks ***/
 
@@ -457,6 +498,15 @@ void createBookmark(int x, int y) {
       E.dirty++;
     }
   }
+
+/***
+void deleteBookmark(int x, int y) {
+  for (int i = 0; i < E.num_bookmarks; i++) {
+    if (E.bookmarks[i].location.column == x && E.bookmarks[i].location.row == y) {
+      E.bookmarks[i] = E.bookmarks[E.num_bookmarks-1];
+    }
+  }
+}*/
 
 void updateBookmarkPointerOnInsert() {
 
@@ -542,38 +592,223 @@ void cycleBookmarks() {
 }
 
 
+/*** regions ***/
+
+void createRegion(locationPointer l, locationPointer r) {
+  struct region new_region;
+
+  new_region.l_pointer = l;
+
+  new_region.r_pointer = r;
+
+  if (E.num_regions <= KILO_REGION_CAPACITY) {
+      E.regions[E.num_regions] = new_region;
+      E.num_regions++;
+      E.dirty++;
+    }
+  }
+
+int checkRegionOverlap(locationPointer l, locationPointer r) {
+  if (E.num_regions > 0) {
+    for (int i = 0; i < E.num_regions; i++) {
+      locationPointer lp_existing = E.regions[i].l_pointer;
+      locationPointer rp_existing = E.regions[i].r_pointer;
+
+      if ( (l.row < rp_existing.row || (l.row == rp_existing.row && l.column <= rp_existing.column)) &&
+           (r.row > lp_existing.row || (r.row == lp_existing.row && r.column >= lp_existing.column)) ) {
+        return 1; 
+      }
+    }
+  }
+  return 0; 
+}
+
+int checkBookmarkOverlap(int x, int y) {
+  if (E.num_bookmarks >0) {
+    for (int i = 0; i < E.num_bookmarks; i++) {
+      if (E.bookmarks[i].location.column == x && E.bookmarks[i].location.row == y) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+
+void updateRegionPointerOnInsert() {
+
+  erow *row = &E.row[E.cy];
+
+  for (int i = 0; i < E.num_regions; i++) {
+    if ((E.regions[i].l_pointer.row == (E.cy)) && E.cx < E.regions[i].l_pointer.column) {
+      E.regions[i].l_pointer.column++;
+    }
+    if ((E.regions[i].r_pointer.row == (E.cy)) && E.cx < E.regions[i].r_pointer.column) {
+      E.regions[i].r_pointer.column++;
+    }
+  }
+}
+
+void updateRegionPointerOnDelete() {
+
+  erow *row = &E.row[E.cy];
+
+  for (int i = 0; i < E.num_regions; i++) {
+    int y = E.regions[i].l_pointer.row;
+    int x = E.regions[i].l_pointer.column;
+    if ((y == (E.cy)) && E.cx <= x && E.cx != 0) {
+      E.regions[i].l_pointer.column--;
+    }
+    int a = E.regions[i].r_pointer.row;
+    int b = E.regions[i].r_pointer.column;
+    if ((a == (E.cy)) && E.cx <= b && E.cx != 0) {
+      E.regions[i].r_pointer.column--;
+    }
+  }
+}
+
+void updateRegionPointerOnDeleteLine() {
+
+  erow *row = &E.row[E.cy];
+
+  for (int i = 0; i < E.num_regions; i++) {
+
+    int y = E.regions[i].l_pointer.row;
+    int x = E.regions[i].l_pointer.column;
+
+    if (y == E.cy) {
+      E.regions[i].l_pointer.row--;
+      E.regions[i].l_pointer.column = x + E.row[E.cy-1].rsize;
+    } else if (y > E.cy) {
+      E.regions[i].l_pointer.row--;
+    }
+    int a = E.regions[i].r_pointer.row;
+    int b = E.regions[i].r_pointer.column;
+
+    if (a == E.cy) {
+      E.regions[i].r_pointer.row--;
+      E.regions[i].r_pointer.column = b + E.row[E.cy-1].rsize;
+    } else if (a > E.cy) {
+      E.regions[i].r_pointer.row--;
+    }
+  }
+}
+
+void cycleRegions() {
+  int x = E.cx;
+  int y = E.cy;
+  struct locationPointer closest;
+  int found = 0;
+
+  if (E.num_bookmarks < 1) {
+    return;
+  }
+
+  for (int i = 0; i < E.num_regions; i++) {
+    int current_row = E.regions[i].l_pointer.row;
+    int current_column = E.regions[i].l_pointer.column;
+
+    if (current_row >= y) {
+      if (found) {
+        if (current_row - y < closest.row - y) {
+          closest = E.regions[i].l_pointer;
+        } else if (current_row == closest.row) {
+          if (current_column < closest.column) {
+            closest = E.regions[i].l_pointer;
+          }
+        }
+      } else if (current_row > y || (current_row == y && current_column > x)) {
+        closest = E.regions[i].l_pointer;
+        found = 1;
+      } 
+    }
+  }
+
+  if (found) {
+    E.cx = closest.column;
+    E.cy = closest.row;
+  } else {
+    if (E.num_bookmarks > 0) {
+      E.cx = 0;
+      E.cy = 0;
+    }
+  }
+}
+
+
+
+
 /*** saving bookmarks and regions ***/
 
-void savePointers() {
-  size_t newLength = strlen(E.filename) + strlen(E.meta_filename) + 100;
+void saveBookmarkPointers() {
+  size_t newLength = strlen(E.filename) + strlen(E.meta_filename1) + 100;
 
   char* mfn = (char*)malloc(newLength * sizeof(char));
 
-  snprintf(mfn, newLength, "%s%s", E.filename, "_metadata");
+  snprintf(mfn, newLength, "%s%s", E.filename, "_metadata1");
 
   FILE *fp_meta = fopen(mfn, "w");
-  //fclose(fp_meta);
 
-  if (E.num_bookmarks != 0 || E.num_regions != 0) {
-    for (int i = 0; i < E.num_bookmarks; i++) {
+  if (E.num_bookmarks != 0) {
+    for (int i = 0; i < E.num_bookmarks-1; i++) {
       char temp_buffer[50];
       sprintf(temp_buffer,"%d,%d_", E.bookmarks[i].location.column, E.bookmarks[i].location.row);
-      //scanf(temp_buffer);
       fputs(temp_buffer, fp_meta);
-      
     }
+    char temp_buffer[50];
+    sprintf(temp_buffer,"%d,%d", E.bookmarks[E.num_bookmarks-1].location.column, E.bookmarks[E.num_bookmarks-1].location.row);
+    fputs(temp_buffer, fp_meta);
+
+    fputs("+", fp_meta);
+
+
   }
   fclose(fp_meta);
   free(mfn);
 }
 
-void readMetadata() {
 
-  size_t newLength = strlen(E.filename) + strlen(E.meta_filename) + 100;
+void saveRegionPointers() {
+  size_t newLength = strlen(E.filename) + strlen(E.meta_filename2) + 100;
+
+  char* mfn = (char*)malloc(newLength * sizeof(char));
+
+  snprintf(mfn, newLength, "%s%s", E.filename, "_metadata2");
+
+  FILE *fp_meta2 = fopen(mfn, "w");
+
+  if (E.num_regions != 0) {
+    for (int i = 0; i < E.num_regions-1; i++) {
+      char temp_buffer[100];
+      sprintf(temp_buffer,"%d,%d,%d,%d_", E.regions[i].l_pointer.column, E.regions[i].l_pointer.row, E.regions[i].r_pointer.column, E.regions[i].r_pointer.row);
+      fputs(temp_buffer, fp_meta2);
+    }
+    char temp_buffer[1000];
+    sprintf(temp_buffer,"%d,%d,%d,%d_", E.regions[E.num_regions-1].l_pointer.column, E.regions[E.num_regions-1].l_pointer.row, E.regions[E.num_regions-1].r_pointer.column, E.regions[E.num_regions-1].r_pointer.row);
+    fputs(temp_buffer, fp_meta2);
+
+
+
+  }
+  fclose(fp_meta2);
+  free(mfn);
+}
+
+
+/***
+    for (int i = 0; i < E.num_regions; i++) {
+      char temp_buffer[100];
+      sprintf(temp_buffer,"%d,%d,%d,%d_", E.regions[i].l_pointer.column, E.regions[i].l_pointer.row, E.regions[i].r_pointer.column, E.regions[i].r_pointer.row);
+      fputs(temp_buffer, fp_meta);
+    } */
+
+void readBookmarkMetadata() {
+
+  size_t newLength = strlen(E.filename) + strlen(E.meta_filename1) + 100;
 
   char* newfile = (char*)malloc(newLength * sizeof(char));
 
-  snprintf(newfile, newLength, "%s%s", E.filename, "_metadata");
+  snprintf(newfile, newLength, "%s%s", E.filename, "_metadata1");
 
   FILE *fp_meta = fopen(newfile, "a+");
 
@@ -605,7 +840,10 @@ void readMetadata() {
 
       num2 = atoi(start);
 
-      createBookmark(num1, num2);
+      if (checkBookmarkOverlap(num1, num2)){
+
+      } else {
+      createBookmark(num1, num2);}
 
       token = line; 
       token = strtok(NULL, "_"); 
@@ -616,6 +854,57 @@ fclose(fp_meta);
 }
 
 
+void readRegionMetadata() {
+
+  size_t newLength = strlen(E.filename) + strlen(E.meta_filename2) + 100;
+
+  char* newfile1 = (char*)malloc(newLength * sizeof(char));
+
+  char* token;
+
+  snprintf(newfile1, newLength, "%s%s", E.filename, "_metadata2");
+
+  FILE *fp_meta1 = fopen(newfile1, "a+");
+
+  if (fp_meta1 == NULL) {
+    return;
+  }
+
+  char line[100];
+  while (fgets(line, sizeof(line), fp_meta1)) {
+    token = strtok(line, ",_");
+
+    while (token != NULL) {
+      int num1, num2, num3, num4;
+
+      num1 = atoi(token);
+      token = strtok(NULL, ",_");
+      num2 = atoi(token);
+      token = strtok(NULL, ",_");
+      num3 = atoi(token);
+      token = strtok(NULL, ",_");
+      num4 = atoi(token);
+
+      struct locationPointer l;
+      struct locationPointer r;
+
+      l.column = num1;
+      l.row = num2;
+      r.column = num3;
+      r.row = num4;
+
+
+      if (checkRegionOverlap(l, r)) {
+        break;
+      } else {
+      createRegion(l, r);
+      }
+      token = strtok(NULL, ",_");
+    }
+  }
+
+fclose(fp_meta1);
+}
 
 
 /*** row operations ***/
@@ -687,8 +976,9 @@ void editorInsertRow(int at, char *s, size_t len) {
   E.row[at].hl_open_comment = 0;
   editorUpdateRow(&E.row[at]);
 
-    //define bookmarks from metadata file
-  readMetadata();
+    //define bookmarks from metadata file VVVV
+  readBookmarkMetadata();
+  readRegionMetadata();
   editorUpdateSyntax(E.row);
 
   E.numrows++;
@@ -777,6 +1067,7 @@ void editorInsertChar(int c) {
   }
 
   updateBookmarkPointerOnInsert();
+  updateRegionPointerOnInsert();
   editorUpdateSyntax(row);
 
   if (E.cy == E.numrows) {
@@ -820,6 +1111,7 @@ void editorDelChar() {
   }
 
   updateBookmarkPointerOnDelete();
+  updateRegionPointerOnDelete();
   editorUpdateSyntax(row);
 
   if (E.cy == E.numrows) return;
@@ -833,6 +1125,7 @@ void editorDelChar() {
     E.cx = E.row[E.cy - 1].size;
 
     updateBookmarkPointerOnDeleteLine();
+    updateRegionPointerOnDeleteLine();
     editorUpdateSyntax(row);
 
     editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
@@ -843,8 +1136,28 @@ void editorDelChar() {
   E.numchars--;
 }
 
-/*** statistics ***/
+/***   edit region    ***/
 
+void openRegion(struct locationPointer thisRegion) {
+  FILE *fp_region;
+  char fileName[] = "temp.txt";
+
+  struct region myRegion;
+
+  for (int i = 0; i < E.num_regions; i++) {
+    if (E.regions[i].l_pointer.column == thisRegion.column
+    && E.regions[i].l_pointer.row == thisRegion.row) {
+      pid_t pid = fork();
+
+      if (pid == -1) {
+        return;
+      } else if (pid == 0) {
+        execl("./kilo temp.txt", "./kilo temp.txt", NULL);
+        return;
+      }
+    }
+  }
+}
 
 
 
@@ -1113,6 +1426,7 @@ void editorMoveCursor(int key) {
 
 void editorProcessKeypress() {
   static int quit_times = KILO_QUIT_TIMES;
+  static int r_times = KILO_R_TIMES;
 
   int c = editorReadKey();
 
@@ -1120,7 +1434,7 @@ void editorProcessKeypress() {
     case '\r':
       
 
-      /////////this is doing the newline dynamics of bookmarks///////
+      /////////this is doing the newline dynamics of bookmarks and regions///////
   
       for (int i = 0; i < E.num_bookmarks; i++) {
           //For when a character is removed from the same line as a bookmark before the bookmark (said bookmark should have it's column decreased by 1)
@@ -1133,7 +1447,29 @@ void editorProcessKeypress() {
         } else if (y > E.cy) {
           E.bookmarks[i].location.row++;
         }
-        printf("/Bookmark column: %d | Bookmark row: %d//", E.bookmarks[i].location.column, E.bookmarks[i].location.row); //for testing
+      }
+
+    for (int i = 0; i < E.num_regions; i++) {
+
+      int y = E.regions[i].l_pointer.row;
+      int x = E.regions[i].l_pointer.column;
+
+        if (y == E.cy && x >= E.cx) {
+          E.regions[i].l_pointer.row++;
+          E.regions[i].l_pointer.column -= E.cx;
+        } else if (y > E.cy) {
+          E.regions[i].l_pointer.row++;
+        }
+
+      int a = E.regions[i].r_pointer.row;
+      int b = E.regions[i].r_pointer.column;
+
+        if (a == E.cy && b >= E.cx) {
+          E.regions[i].r_pointer.row++;
+          E.regions[i].r_pointer.column -= E.cx;
+        } else if (a > E.cy) {
+          E.regions[i].r_pointer.row++;
+        }
       }
       
 
@@ -1155,21 +1491,67 @@ void editorProcessKeypress() {
 
     case CTRL_KEY('s'):
       editorSave();
-      savePointers();
+      saveBookmarkPointers();
+      saveRegionPointers();
       break;
 
 //----------------------------------------------
 
     case CTRL_KEY('b'): {
       erow *row = &E.row[E.cy];
+      if (checkBookmarkOverlap(E.cx, E.cy)){
+        break;
+      } else {
       createBookmark(E.cx, E.cy);
       editorUpdateSyntax(row);
-      break;
+      break;}
     }
 
     case CTRL_KEY('n'):
       cycleBookmarks();
       break;
+
+    case CTRL_KEY('w'):
+    cycleRegions();
+      break;
+
+    case CTRL_KEY('r'): {
+      if (r_times == 1) {
+        erow *f_row = &E.row[E.cy];
+ 
+        E.temp_pointer.column = E.cx;
+        E.temp_pointer.row = E.cy;
+        r_times--;
+      } else if (r_times == 0) {
+        erow *f_row = &E.row[E.cy];
+
+        struct locationPointer r_pointer;
+        r_pointer.column = E.cx;
+        r_pointer.row = E.cy;
+
+        if (checkRegionOverlap(E.temp_pointer, r_pointer)) {
+          break;
+        } else {
+        createRegion(E.temp_pointer, r_pointer);
+        editorFullSyntaxUpdate();
+        r_times = KILO_R_TIMES;
+        }
+      }
+      
+      break;
+    }
+
+    //for entering region. Occurs when on its left or right pointer.
+
+    //REMOVED DUE TO POOR FUNCTIONALITY
+    /***
+    case CTRL_KEY('e'): {
+      locationPointer ptr;
+      ptr.column = E.cx;
+      ptr.row = E.cy;
+      openRegion(ptr);
+      break;
+    }*/
 
 //----------------------------------------------
 
@@ -1396,7 +1778,7 @@ int main(int argc, char *argv[]) {
   }
 
   editorSetStatusMessage(
-    "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find | Ctrl-B = create bookmark | Ctrl-N = move to next bookmark");
+    "HELP: Ctrl-S save Ctrl-Q quit Ctrl-F find Ctrl-B bookmark Ctrl-R region");
 
   while (1) {
     editorRefreshScreen();
@@ -1405,3 +1787,7 @@ int main(int argc, char *argv[]) {
 
   return 0;
 }
+
+
+
+
